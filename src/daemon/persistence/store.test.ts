@@ -427,6 +427,113 @@ describe("StateStore", () => {
     store.close()
   })
 
+  test("keeps every in-flight bundle member until acknowledgement", () => {
+    const store = createStore()
+    store.registerClient("bundle-client", { pid: 1, projectRoot: "/tmp/project" })
+    store.registerSession({
+      clientId: "bundle-client",
+      sessionId: "bundle-session",
+      repo: "acme/repo",
+      branch: "feature/bundle",
+      isPrimary: true,
+      status: "active",
+      busyState: "idle",
+    })
+    const subscriptions = [
+      { prNumber: 7, source: "manual" as const },
+      { prNumber: 8, source: "manual" as const },
+      { prNumber: 9, source: "automatic" as const },
+    ].map(({ prNumber, source }) =>
+      store.upsertSubscription({
+        sessionId: "bundle-session",
+        repo: "acme/repo",
+        prNumber,
+        source,
+      }),
+    )
+    const batchIds = subscriptions.map((subscription) =>
+      store.createOrReplaceReminder(
+        "bundle-session",
+        subscription.subscriptionId,
+        `Reminder ${subscription.prNumber}`,
+        [],
+        0,
+      ),
+    )
+    const bundle = store.claimReminderBundle("bundle-session")
+    assert.ok(bundle)
+
+    assert.equal(store.unsubscribe("bundle-session", "acme/repo", 8), true)
+    assert.equal(store.deactivateAutomaticSubscriptions("bundle-session"), 1)
+    assert.equal(
+      store.ackReminderBundle({
+        sessionId: "bundle-session",
+        handoffId: bundle.handoffId,
+        state: "confirmed",
+      }),
+      3,
+    )
+    assert.deepEqual(
+      batchIds.map((batchId) => store.getReminderBatchRecord(batchId)),
+      [null, null, null],
+    )
+    store.close()
+  })
+
+  test("failed bundle acknowledgement removes members canceled in flight", () => {
+    const store = createStore()
+    store.registerClient("bundle-client", { pid: 1, projectRoot: "/tmp/project" })
+    store.registerSession({
+      clientId: "bundle-client",
+      sessionId: "bundle-session",
+      repo: "acme/repo",
+      branch: "feature/bundle",
+      isPrimary: true,
+      status: "active",
+      busyState: "idle",
+    })
+    const subscriptions = [7, 8].map((prNumber) =>
+      store.upsertSubscription({
+        sessionId: "bundle-session",
+        repo: "acme/repo",
+        prNumber,
+        source: "manual",
+      }),
+    )
+    const batchIds = subscriptions.map((subscription) =>
+      store.createOrReplaceReminder(
+        "bundle-session",
+        subscription.subscriptionId,
+        `Reminder ${subscription.prNumber}`,
+        [],
+        0,
+      ),
+    )
+    const bundle = store.claimReminderBundle("bundle-session")
+    assert.ok(bundle)
+    assert.equal(store.unsubscribe("bundle-session", "acme/repo", 8), true)
+
+    assert.equal(
+      store.ackReminderBundle({
+        sessionId: "bundle-session",
+        handoffId: bundle.handoffId,
+        state: "failed",
+        error: "host injection failed",
+      }),
+      2,
+    )
+    assert.equal(store.getReminderBatchRecord(batchIds[1]), null)
+    assert.equal(store.getReminderBatchRecord(batchIds[0])?.state, "failed")
+
+    const retry = store.claimReminderBundle("bundle-session")
+    assert.ok(retry)
+    assert.deepEqual(
+      retry.batches.map(({ batchId }) => batchId),
+      [batchIds[0]],
+    )
+    store.close()
+  })
+
   test("paused sessions block delivery and resumed sessions recover", () => {
     const store = createStore()
 
@@ -1627,6 +1734,50 @@ describe("StateStore", () => {
     assert.equal(store.getSession("session-reject")?.pr_number, null)
     assert.equal(store.getPendingReminder("session-reject"), null)
     assert.equal(store.buildReminderBatch("session-reject"), null)
+    store.close()
+  })
+
+  test("failed acknowledgement cannot retarget a rejected legacy handoff", () => {
+    const store = createStore()
+    store.registerClient("client-retarget", { pid: 1, projectRoot: "/tmp/project" })
+    store.registerSession({
+      clientId: "client-retarget",
+      sessionId: "session-retarget",
+      repo: "acme/repo",
+      branch: "feature/retarget",
+      isPrimary: true,
+      status: "active",
+      busyState: "idle",
+    })
+    store.recordBranchAssociation("acme/repo", "feature/retarget", 7)
+    assert.equal(store.unsubscribe("session-retarget", "acme/repo", 7), true)
+    store.insertEvents("acme/repo", 7, [
+      {
+        dedupeKey: "legacy-retarget-event",
+        kind: "review.approved",
+        priority: "high",
+        summary: "legacy PR 7 event",
+        payload: {},
+      },
+    ])
+    const batch = store.buildReminderBatch("session-retarget")
+    assert.ok(batch)
+    const bundle = store.claimReminderBundle("session-retarget")
+    assert.ok(bundle)
+
+    store.rejectAutomaticPullRequest("session-retarget", "acme/repo", 7)
+    store.recordBranchAssociation("acme/repo", "feature/retarget", 8)
+    assert.equal(
+      store.ackReminderBundle({
+        sessionId: "session-retarget",
+        handoffId: bundle.handoffId,
+        state: "failed",
+      }),
+      1,
+    )
+
+    assert.equal(store.getReminderBatchRecord(batch.batchId), null)
+    assert.equal(store.claimReminderBundle("session-retarget"), null)
     store.close()
   })
 

@@ -15,17 +15,55 @@ type ClaudeHarnessArgs = Pick<StartIdleArgs, "daemonClient" | "sessionId">
 
 const createClaudeHarness = ({ daemonClient, sessionId }: ClaudeHarnessArgs) => {
 	const captured: DeliveryCapture[] = []
-	const ipc = async (type: string, payload: { sessionId: string; busyState?: "busy" | "idle" }) => {
+	let handoffEntry: {
+		handoffId: string
+		mode: "bundle" | "legacy" | "legacy-bundle"
+	} | undefined
+	const handoffs = {
+		async replace(
+			_sessionId: string,
+			entry: {
+				handoffId: string
+				mode: "bundle" | "legacy" | "legacy-bundle"
+			},
+		) {
+			handoffEntry = entry
+		},
+		async peek(_sessionId: string) {
+			return handoffEntry
+		},
+		async remove(_sessionId: string, handoffId: string) {
+			if (handoffEntry?.handoffId === handoffId) handoffEntry = undefined
+		},
+		async clear(_sessionId: string) {
+			handoffEntry = undefined
+		},
+	}
+	const ipc = async (
+		type: string,
+		payload: {
+			sessionId: string
+			busyState?: "busy" | "idle"
+			state?: "confirmed" | "failed"
+			handoffId?: string
+			error?: string
+		},
+	) => {
 		switch (type) {
 			case "touchClaudeSession":
 				return daemonClient.touchClaudeSession({
 					sessionId: payload.sessionId,
 					busyState: payload.busyState ?? "idle",
 				})
-			case "claimClaudeReminder":
-				return daemonClient.claimClaudeReminder(payload.sessionId)
-			case "confirmClaudeHandoff":
-				return daemonClient.confirmClaudeHandoff(payload.sessionId)
+			case "claimReminderBundle":
+				return daemonClient.claimReminderBundle(payload.sessionId)
+			case "ackReminderBundle":
+				return daemonClient.ackReminderBundle({
+					sessionId: payload.sessionId,
+					handoffId: payload.handoffId ?? "missing-handoff-id",
+					state: payload.state ?? "confirmed",
+					...(payload.error ? { error: payload.error } : {}),
+				})
 			default:
 				throw new Error(`unexpected Claude hook request: ${type}`)
 		}
@@ -36,6 +74,7 @@ const createClaudeHarness = ({ daemonClient, sessionId }: ClaudeHarnessArgs) => 
 			{ session_id: sessionId, ...(stopHookActive ? { stop_hook_active: true } : {}) },
 			ipc,
 			{ CLAUDE_CODE_SESSION_ID: sessionId },
+			handoffs,
 		)) as HookOutput | undefined
 		if (output) {
 			captured.push({

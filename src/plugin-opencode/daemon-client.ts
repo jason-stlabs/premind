@@ -2,10 +2,13 @@ import net from "node:net"
 import { randomUUID } from "node:crypto"
 import { PREMIND_PROTOCOL_VERSION, PREMIND_SOCKET_PATH } from "../shared/constants.ts"
 import {
+  ackReminderBundleResponseSchema,
+  claimReminderBundleResponseSchema,
   activateWorktreeResponseSchema,
   debugStatusResponseSchema,
   getPendingReminderResponseSchema,
   globalDisabledResponseSchema,
+  legacyClaimReminderBundleResponseSchema,
   registerClientResponseSchema,
   responseSchema,
   subscribeResponseSchema,
@@ -13,6 +16,7 @@ import {
 } from "../shared/ipc.ts"
 import type {
   AckReminderPayload,
+  AckReminderBundlePayload,
   ActivateWorktreePayload,
   EnsureSessionControlPayload,
   RegisterSessionPayload,
@@ -24,6 +28,8 @@ import { ensureDaemonRunning } from "./daemon-launcher.ts"
 
 const MAX_RETRIES = 3
 const RETRY_DELAY_MS = 500
+const isUnsupportedOperation = (error: unknown) =>
+  error instanceof Error && error.message.startsWith("BAD_REQUEST:")
 
 export class PremindDaemonClient {
   readonly clientId = randomUUID()
@@ -31,6 +37,14 @@ export class PremindDaemonClient {
   private projectRoot?: string
   private sessionSource?: string
 
+  private readonly legacyBundleClaims = new Map<
+    string,
+    {
+      handoffId: string
+      batchIds: string[]
+      mode: "single" | "legacy-bundle"
+    }
+  >()
   async registerClient(projectRoot: string, sessionSource?: string) {
     this.projectRoot = projectRoot
     this.sessionSource = sessionSource
@@ -156,6 +170,89 @@ export class PremindDaemonClient {
       payload,
     })
     return unsubscribeResponseSchema.parse(response)
+  }
+
+  async claimReminderBundle(sessionId: string) {
+    try {
+      const response = await this.requestWithRetry({
+        type: "claimReminderBundle",
+        protocolVersion: PREMIND_PROTOCOL_VERSION,
+        payload: { sessionId },
+      })
+      const current = claimReminderBundleResponseSchema.safeParse(response)
+      if (current.success) return current.data
+
+      const legacy = legacyClaimReminderBundleResponseSchema.safeParse(response)
+      if (!legacy.success) return claimReminderBundleResponseSchema.parse(response)
+      if (legacy.data.batches.length === 0) return { bundle: null }
+      const handoffId = randomUUID()
+      this.legacyBundleClaims.set(sessionId, {
+        handoffId,
+        batchIds: legacy.data.batches.map(({ batchId }) => batchId),
+        mode: "legacy-bundle",
+      })
+      return { bundle: { handoffId, batches: legacy.data.batches } }
+    } catch (error) {
+      if (!isUnsupportedOperation(error)) throw error
+      const pending = await this.getPendingReminder(sessionId)
+      if (!pending.batch) return { bundle: null }
+
+      await this.ackReminder({
+        batchId: pending.batch.batchId,
+        sessionId,
+        state: "handed_off",
+      })
+      const handoffId = randomUUID()
+      this.legacyBundleClaims.set(sessionId, {
+        handoffId,
+        batchIds: [pending.batch.batchId],
+        mode: "single",
+      })
+      return { bundle: { handoffId, batches: [pending.batch] } }
+    }
+  }
+
+  async ackReminderBundle(payload: AckReminderBundlePayload) {
+    try {
+      const response = await this.requestWithRetry({
+        type: "ackReminderBundle",
+        protocolVersion: PREMIND_PROTOCOL_VERSION,
+        payload,
+      })
+      return ackReminderBundleResponseSchema.parse(response)
+    } catch (error) {
+      if (!isUnsupportedOperation(error)) throw error
+      const claim = this.legacyBundleClaims.get(payload.sessionId)
+      if (!claim || claim.handoffId !== payload.handoffId) {
+        return { acknowledged: 0 }
+      }
+
+      if (claim.mode === "legacy-bundle") {
+        const response = await this.requestWithRetry({
+          type: "ackReminderBundle",
+          protocolVersion: PREMIND_PROTOCOL_VERSION,
+          payload: {
+            sessionId: payload.sessionId,
+            state: payload.state,
+            ...(payload.error ? { error: payload.error } : {}),
+          },
+        })
+        const acknowledged = ackReminderBundleResponseSchema.parse(response)
+        this.legacyBundleClaims.delete(payload.sessionId)
+        return acknowledged
+      }
+
+      for (const batchId of claim.batchIds) {
+        await this.ackReminder({
+          batchId,
+          sessionId: payload.sessionId,
+          state: payload.state,
+          ...(payload.error ? { error: payload.error } : {}),
+        })
+      }
+      this.legacyBundleClaims.delete(payload.sessionId)
+      return { acknowledged: claim.batchIds.length }
+    }
   }
 
   async getPendingReminder(sessionId: string) {

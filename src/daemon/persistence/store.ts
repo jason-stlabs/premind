@@ -13,6 +13,7 @@ import {
 } from "../../shared/constants.ts";
 import type {
 	AckReminderPayload,
+	AckReminderBundlePayload,
 	ClientMetadata,
 	EnsureSessionControlPayload,
 	RegisterSessionPayload,
@@ -108,6 +109,8 @@ type ReminderRow = {
 	events_json: string;
 	state: ReminderHandoffState;
 	max_event_seq: number | null;
+	handoff_id: string | null;
+	handoff_size: number | null;
 	repo?: string | null;
 	pr_number?: number | null;
 	source?: SubscriptionSource | null;
@@ -117,6 +120,13 @@ export type ReminderBatchRecord = Omit<ReminderBatch, "subscriptionId"> & {
 	state: ReminderHandoffState;
 	subscriptionId: string | null;
 	maxEventSeq: number | null;
+	handoffId: string | null;
+	handoffSize: number | null;
+};
+
+export type ReminderBundleClaim = {
+	handoffId: string;
+	batches: ReminderBatch[];
 };
 
 type EventRow = {
@@ -778,7 +788,7 @@ export class StateStore {
 					 WHERE subscription_id IN (
 					   SELECT subscription_id FROM session_subscriptions
 					   WHERE session_id = :sessionId AND repo = :repo AND pr_number = :prNumber
-					 )`,
+					 ) AND state != 'handed_off'`,
 				)
 				.run({ sessionId, repo, prNumber });
 			const result = this.db
@@ -799,7 +809,7 @@ export class StateStore {
 					 WHERE subscription_id IN (
 					   SELECT subscription_id FROM session_subscriptions
 					   WHERE session_id = :sessionId AND source = 'automatic'
-					 )`,
+					 ) AND state != 'handed_off'`,
 				)
 				.run({ sessionId });
 			const result = this.db
@@ -821,8 +831,16 @@ export class StateStore {
 		return this.transaction(() => {
 			this.db
 				.prepare(
+					`UPDATE reminder_batches SET canceled_at = :now, updated_at = :now
+					 WHERE session_id = :sessionId AND subscription_id IS NULL
+					   AND state = 'handed_off'`,
+				)
+				.run({ sessionId, now });
+			this.db
+				.prepare(
 					`DELETE FROM reminder_batches
-					 WHERE session_id = :sessionId AND subscription_id IS NULL`,
+					 WHERE session_id = :sessionId AND subscription_id IS NULL
+					   AND state != 'handed_off'`,
 				)
 				.run({ sessionId });
 			this.db
@@ -1766,6 +1784,131 @@ export class StateStore {
 		return record ? this.refreshPendingReminder(record) : null;
 	}
 
+	/** Atomically claims every currently deliverable batch for a session. */
+	claimReminderBundle(
+		sessionId: string,
+		now = Date.now(),
+	): ReminderBundleClaim | null {
+		return this.transaction(() => {
+			this.expireStaleHandoffs(undefined, now);
+			if (this.listInFlightReminderBatchRecords(sessionId).length > 0) return null;
+
+			const batches = this.listPendingLegacyReminderBatchRecords(sessionId).flatMap(
+				(record) => {
+					const refreshed = this.refreshPendingReminder(record);
+					return refreshed ? [refreshed] : [];
+				},
+			);
+			const subscriptions = this.listSessionSubscriptions(sessionId, "active");
+			for (const subscription of subscriptions) {
+				const batch =
+					this.getPendingReminderForSubscription(subscription.subscriptionId) ??
+					this.buildReminderBatchForSubscription(subscription.subscriptionId, now);
+				if (batch) batches.push(batch);
+			}
+
+			if (subscriptions.length === 0 && batches.length === 0) {
+				const batch = this.buildReminderBatch(sessionId, now);
+				if (batch) batches.push(batch);
+			}
+			if (batches.length === 0) return null;
+
+			const handoffId = randomUUID();
+			const handoffSize = batches.length;
+			for (const batch of batches) {
+				const record = this.getReminderBatchRecord(batch.batchId, sessionId);
+				if (!record) throw new Error(`Missing reminder batch ${batch.batchId}`);
+				if (
+					record.state === "failed" &&
+					!this.transitionReminderBatchState(
+						batch.batchId,
+						sessionId,
+						"failed",
+						"built",
+						now,
+					)
+				)
+					throw new Error(`Failed to retry reminder batch ${batch.batchId}`);
+
+				const result = this.db
+					.prepare(
+						`UPDATE reminder_batches
+						 SET state = 'handed_off', handoff_id = :handoffId,
+						     handoff_size = :handoffSize, updated_at = :now
+						 WHERE batch_id = :batchId AND session_id = :sessionId AND state = 'built'`,
+					)
+					.run({ handoffId, handoffSize, now, batchId: batch.batchId, sessionId });
+				if (result.changes !== 1)
+					throw new Error(`Failed to claim reminder batch ${batch.batchId}`);
+			}
+			return { handoffId, batches };
+		});
+	}
+
+	/** Resolves exactly one claimed reminder bundle atomically. */
+	ackReminderBundle(payload: AckReminderBundlePayload, now = Date.now()): number {
+		return this.transaction(() => {
+			const records = this.listInFlightReminderBatchRecords(
+				payload.sessionId,
+				payload.handoffId,
+			);
+			if (records.length === 0) return 0;
+			const expectedSize = records[0].handoffSize;
+			if (
+				expectedSize !== records.length ||
+				records.some(
+					(record) =>
+						record.handoffId !== payload.handoffId ||
+						record.handoffSize !== expectedSize,
+				)
+			)
+				throw new Error(`Incomplete reminder handoff ${payload.handoffId}`);
+
+			for (const record of records) {
+				const acknowledged = this.ackReminder(
+					{
+						batchId: record.batchId,
+						sessionId: payload.sessionId,
+						state: payload.state,
+						...(payload.error ? { error: payload.error } : {}),
+					},
+					now,
+				);
+				if (!acknowledged)
+					throw new Error(`Failed to acknowledge reminder batch ${record.batchId}`);
+			}
+			if (payload.state === "failed") {
+				this.db
+					.prepare(
+						`UPDATE reminder_batches SET handoff_id = NULL, handoff_size = NULL
+						 WHERE session_id = :sessionId AND handoff_id = :handoffId`,
+					)
+					.run({ sessionId: payload.sessionId, handoffId: payload.handoffId });
+				this.db
+					.prepare(
+						`DELETE FROM reminder_batches
+						 WHERE session_id = :sessionId AND state = 'failed'
+						   AND (
+						     subscription_id IN (
+						       SELECT subscription_id FROM session_subscriptions
+						       WHERE session_id = :sessionId AND state != 'active'
+						     )
+						     OR canceled_at IS NOT NULL
+						     OR (
+						       subscription_id IS NULL
+						       AND NOT EXISTS (
+						         SELECT 1 FROM sessions
+						         WHERE session_id = :sessionId AND pr_number IS NOT NULL
+						       )
+						     )
+						   )`,
+					)
+					.run({ sessionId: payload.sessionId });
+			}
+			return records.length;
+		});
+	}
+
 	/**
 	 * Claims exactly one durable reminder for Claude in the same SQLite
 	 * transaction that selects/builds it. This prevents a second Stop hook from
@@ -1834,6 +1977,8 @@ export class StateStore {
 				   ON session_subscriptions.subscription_id = reminder_batches.subscription_id
 				 WHERE reminder_batches.session_id = :sessionId
 				   AND reminder_batches.state IN ('built', 'failed')
+				   AND (reminder_batches.subscription_id IS NOT NULL
+				        OR reminder_batches.canceled_at IS NULL)
 				   AND (reminder_batches.subscription_id IS NULL OR session_subscriptions.state = 'active')
 				 ORDER BY reminder_batches.created_at ASC LIMIT 1`,
 			)
@@ -1881,6 +2026,12 @@ export class StateStore {
 				 WHERE state = 'handed_off' AND updated_at < :cutoff`,
 			)
 			.run({ now, cutoff: now - thresholdMs });
+		this.db
+			.prepare(
+				`DELETE FROM reminder_batches
+				 WHERE canceled_at IS NOT NULL AND state = 'failed'`,
+			)
+			.run();
 		return result.changes as number;
 	}
 
@@ -1893,7 +2044,7 @@ export class StateStore {
 				? this.db
 						.prepare(
 							`SELECT reminder_batches.batch_id, reminder_batches.session_id, reminder_batches.subscription_id,
-						        reminder_batches.reminder_text, reminder_batches.events_json, reminder_batches.state, reminder_batches.max_event_seq,
+						        reminder_batches.reminder_text, reminder_batches.events_json, reminder_batches.state, reminder_batches.max_event_seq, reminder_batches.handoff_id, reminder_batches.handoff_size,
 						        session_subscriptions.repo, session_subscriptions.pr_number, session_subscriptions.source
 						 FROM reminder_batches LEFT JOIN session_subscriptions USING (subscription_id)
 						 WHERE batch_id = :batchId AND reminder_batches.session_id = :sessionId`,
@@ -1902,7 +2053,7 @@ export class StateStore {
 				: this.db
 						.prepare(
 							`SELECT reminder_batches.batch_id, reminder_batches.session_id, reminder_batches.subscription_id,
-						        reminder_batches.reminder_text, reminder_batches.events_json, reminder_batches.state, reminder_batches.max_event_seq,
+						        reminder_batches.reminder_text, reminder_batches.events_json, reminder_batches.state, reminder_batches.max_event_seq, reminder_batches.handoff_id, reminder_batches.handoff_size,
 						        session_subscriptions.repo, session_subscriptions.pr_number, session_subscriptions.source
 						 FROM reminder_batches LEFT JOIN session_subscriptions USING (subscription_id)
 						 WHERE batch_id = :batchId`,
@@ -1922,6 +2073,55 @@ export class StateStore {
 				 WHERE reminder_batches.state != 'confirmed' ORDER BY reminder_batches.created_at ASC`,
 			)
 			.all() as ReminderRow[];
+		return rows.flatMap((row) => {
+			const record = this.toReminderBatchRecord(row);
+			return record ? [record] : [];
+		});
+	}
+
+	listInFlightReminderBatchRecords(
+		sessionId: string,
+		handoffId?: string,
+	): ReminderBatchRecord[] {
+		const rows = this.db
+			.prepare(
+				`SELECT reminder_batches.batch_id, reminder_batches.session_id, reminder_batches.subscription_id,
+				        reminder_batches.reminder_text, reminder_batches.events_json, reminder_batches.state,
+				        reminder_batches.max_event_seq, reminder_batches.handoff_id, reminder_batches.handoff_size,
+				        session_subscriptions.repo, session_subscriptions.pr_number, session_subscriptions.source
+				 FROM reminder_batches LEFT JOIN session_subscriptions USING (subscription_id)
+				 WHERE reminder_batches.session_id = :sessionId
+				   AND reminder_batches.state = 'handed_off'
+				   AND (:handoffId IS NULL OR reminder_batches.handoff_id = :handoffId)
+				 ORDER BY reminder_batches.created_at ASC`,
+			)
+			.all({ sessionId, handoffId: handoffId ?? null }) as ReminderRow[];
+		return rows.flatMap((row) => {
+			const record = this.toReminderBatchRecord(row);
+			return record ? [record] : [];
+		});
+	}
+
+	private listPendingLegacyReminderBatchRecords(
+		sessionId: string,
+	): ReminderBatchRecord[] {
+		const rows = this.db
+			.prepare(
+				`SELECT reminder_batches.batch_id, reminder_batches.session_id,
+				        reminder_batches.subscription_id, reminder_batches.reminder_text,
+				        reminder_batches.events_json, reminder_batches.state,
+				        reminder_batches.max_event_seq, reminder_batches.handoff_id,
+				        reminder_batches.handoff_size, sessions.repo, sessions.pr_number,
+				        NULL AS source
+				 FROM reminder_batches
+				 LEFT JOIN sessions ON sessions.session_id = reminder_batches.session_id
+				 WHERE reminder_batches.session_id = :sessionId
+				   AND reminder_batches.subscription_id IS NULL
+				   AND reminder_batches.canceled_at IS NULL
+				   AND reminder_batches.state IN ('built', 'failed')
+				 ORDER BY reminder_batches.created_at ASC`,
+			)
+			.all({ sessionId }) as ReminderRow[];
 		return rows.flatMap((row) => {
 			const record = this.toReminderBatchRecord(row);
 			return record ? [record] : [];
@@ -2188,6 +2388,8 @@ export class StateStore {
 				events: JSON.parse(row.events_json) as ReminderEvent[],
 				state: row.state,
 				maxEventSeq: row.max_event_seq,
+				handoffId: row.handoff_id ?? null,
+				handoffSize: row.handoff_size ?? null,
 			};
 		} catch {
 			return null;
@@ -2578,6 +2780,9 @@ export class StateStore {
         events_json TEXT NOT NULL,
         state TEXT NOT NULL,
         max_event_seq INTEGER,
+        handoff_id TEXT,
+        handoff_size INTEGER,
+        canceled_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -2754,6 +2959,9 @@ export class StateStore {
 					events_json TEXT NOT NULL,
 					state TEXT NOT NULL,
 					max_event_seq INTEGER,
+					handoff_id TEXT,
+					handoff_size INTEGER,
+					canceled_at INTEGER,
 					created_at INTEGER NOT NULL,
 					updated_at INTEGER NOT NULL,
 					FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -2774,6 +2982,22 @@ export class StateStore {
 				ALTER TABLE reminder_batches_next RENAME TO reminder_batches;
 			`);
 		}
+		const currentReminderColumns = this.db
+			.prepare(`PRAGMA table_info(reminder_batches)`)
+			.all() as Array<{ name: string }>;
+		if (!currentReminderColumns.some((column) => column.name === "handoff_id")) {
+			this.db.exec(`ALTER TABLE reminder_batches ADD COLUMN handoff_id TEXT`);
+		}
+		if (!currentReminderColumns.some((column) => column.name === "handoff_size")) {
+			this.db.exec(`ALTER TABLE reminder_batches ADD COLUMN handoff_size INTEGER`);
+		}
+		if (!currentReminderColumns.some((column) => column.name === "canceled_at")) {
+			this.db.exec(`ALTER TABLE reminder_batches ADD COLUMN canceled_at INTEGER`);
+		}
+		this.db.exec(`
+			CREATE INDEX IF NOT EXISTS reminder_batches_handoff
+			ON reminder_batches(session_id, handoff_id, state);
+		`);
 
 		// Rename pr_events.detail_file_path -> reference_link. The legacy name
 		// implied a local file path, but the column actually stores either a

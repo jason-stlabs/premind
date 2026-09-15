@@ -12,6 +12,7 @@ import { PremindDaemonClient } from "../plugin-opencode/daemon-client.ts";
 import { detectGitContext } from "../plugin-opencode/git-context.ts";
 import type {
 	AckReminderPayload,
+	AckReminderBundlePayload,
 	ActivateWorktreePayload,
 	DebugStatusResponse,
 	EnsureSessionControlPayload,
@@ -53,6 +54,14 @@ type DaemonClientLike = {
 		sessionId: string;
 		busyState: "busy" | "idle";
 	}) => Promise<unknown>;
+	claimReminderBundle: (
+		sessionId: string,
+	) => Promise<{
+		bundle: { handoffId: string; batches: ReminderBatch[] } | null;
+	}>;
+	ackReminderBundle: (
+		payload: AckReminderBundlePayload,
+	) => Promise<{ acknowledged: number }>;
 	getPendingReminder: (
 		sessionId: string,
 	) => Promise<{ batch: ReminderBatch | null }>;
@@ -368,40 +377,34 @@ export const createPremindPiExtension = (
 			);
 		};
 
-		const deliverPendingReminder = async (
+		const deliverPendingReminders = async (
 			sessionId: string,
+			generation: number,
 			options: { force?: boolean } = {},
-			generation?: number,
 		) => {
 			if (
 				!config.enabled ||
 				(!options.force && !config.autoDeliver) ||
 				deliveryInFlight ||
-				(generation !== undefined && generation !== sessionGeneration)
+				generation !== sessionGeneration
 			)
 				return { delivered: false as const };
 			deliveryInFlight = true;
 			const client = getClient();
-			let batch: ReminderBatch | null = null;
+			let batches: ReminderBatch[] = [];
+			let handoffId: string | null = null;
 			let handedOff = false;
 			try {
-				const pending = await client.getPendingReminder(sessionId);
-				if (generation !== undefined && generation !== sessionGeneration)
-					return { delivered: false as const };
-				batch = pending.batch;
-				if (!batch) return { delivered: false as const };
-
-				await client.ackReminder({
-					batchId: batch.batchId,
-					sessionId,
-					state: "handed_off",
-				});
+				const bundle = (await client.claimReminderBundle(sessionId)).bundle;
+				if (!bundle) return { delivered: false as const };
+				batches = bundle.batches;
+				handoffId = bundle.handoffId;
 				handedOff = true;
 
-				if (generation !== undefined && generation !== sessionGeneration) {
-					await client.ackReminder({
-						batchId: batch.batchId,
+				if (generation !== sessionGeneration) {
+					await client.ackReminderBundle({
 						sessionId,
+						handoffId,
 						state: "failed",
 						error: "Pi session ended before reminder delivery",
 					});
@@ -409,28 +412,40 @@ export const createPremindPiExtension = (
 					return { delivered: false as const };
 				}
 
+				const reminderText = batches
+					.map((batch) => batch.reminderText)
+					.join("\n\n");
+				const details: ReminderBatch = {
+					...batches[0],
+					reminderText,
+					events: batches.flatMap((batch) => batch.events),
+				};
 				pi.sendMessage(
 					{
 						customType: "premind-reminder",
-						content: batch.reminderText,
+						content: reminderText,
 						display: true,
-						details: batch,
+						details,
 					},
 					{ deliverAs: "followUp", triggerTurn: true },
 				);
-				await client.ackReminder({
-					batchId: batch.batchId,
+				const result = await client.ackReminderBundle({
 					sessionId,
+					handoffId,
 					state: "confirmed",
 				});
+				if (result.acknowledged !== batches.length)
+					throw new Error(
+						`Confirmed ${result.acknowledged} of ${batches.length} reminder batches`,
+					);
 				handedOff = false;
-				return { delivered: true as const, batch };
+				return { delivered: true as const, batches };
 			} catch (error) {
-				if (batch && handedOff) {
+				if (handedOff) {
 					try {
-						await client.ackReminder({
-							batchId: batch.batchId,
+						await client.ackReminderBundle({
 							sessionId,
+							handoffId: handoffId!,
 							state: "failed",
 							error: error instanceof Error ? error.message : String(error),
 						});
@@ -442,19 +457,6 @@ export const createPremindPiExtension = (
 			} finally {
 				deliveryInFlight = false;
 			}
-		};
-
-		const deliverPendingReminders = async (
-			sessionId: string,
-			generation: number,
-		) => {
-			let delivered = false;
-			while (generation === sessionGeneration) {
-				const result = await deliverPendingReminder(sessionId, {}, generation);
-				if (!result.delivered) break;
-				delivered = true;
-			}
-			return { delivered };
 		};
 
 		const markBusyState = async (busyState: "busy" | "idle") => {
@@ -729,18 +731,20 @@ export const createPremindPiExtension = (
 
 		pi.registerCommand("premind:flush", {
 			description:
-				"Deliver one pending premind reminder for the current session, if any",
+				"Deliver all pending premind reminders for the current session, if any",
 			handler: async (_args, ctx) => {
 				const sessionId = currentSessionId ?? getPiSessionId(ctx);
 				try {
-					const result = await deliverPendingReminder(sessionId, {
-						force: true,
-					});
+					const result = await deliverPendingReminders(
+						sessionId,
+						sessionGeneration,
+						{ force: true },
+					);
 					if (result.delivered) setStatus(ctx, undefined);
 					else await refreshStatusbar(ctx);
 					ctx.ui.notify(
 						result.delivered
-							? `premind delivered reminder batch ${result.batch.batchId}.`
+							? `premind delivered ${result.batches.length} reminder batch${result.batches.length === 1 ? "" : "es"}.`
 							: "premind has no pending reminders for this session.",
 						"info",
 					);
