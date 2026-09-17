@@ -1,6 +1,7 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import { PREMIND_CLIENT_HEARTBEAT_MS, PREMIND_IDLE_DELIVERY_THRESHOLD_MS } from "../shared/constants.ts"
 import type { PremindConfig } from "../shared/schema.ts"
+import { PREMIND_VERSION_LABEL } from "../shared/version.ts"
 import { ensureUserConfigTemplate, getDefaultUserConfigPath, getLegacyUserConfigPath, loadPremindConfig } from "../shared/config-loader.ts"
 import { PremindDaemonClient } from "./daemon-client.ts"
 import { renderPremindStatus } from "./commands.ts"
@@ -10,6 +11,7 @@ import { ensureDaemonRunning } from "./daemon-launcher.ts"
 
 const COMMAND_MARKERS = {
   status: "[PREMIND_STATUS]",
+  doctor: "[PREMIND_DOCTOR]",
   sendNow: "[PREMIND_SEND_NOW]",
   disable: "[PREMIND_DISABLE]",
   enable: "[PREMIND_ENABLE]",
@@ -758,17 +760,17 @@ export const createPremindPlugin = (dependencies: PremindPluginDependencies = {}
   }
 
 
-  const handleSendNowCommand = async (sessionID: string, inputRef?: { agent?: string; model?: { providerID: string; modelID: string } }) => {
+  const deliverPendingNow = async (sessionID: string) => {
     const pending = await daemon.getPendingReminder(sessionID)
-    if (!pending.batch) {
-      await injectResponse(sessionID, "premind: no pending PR updates to send", inputRef)
-      return
-    }
-    // Cancel the countdown timer and deliver immediately.
+    if (!pending.batch) return "premind: no pending PR updates to deliver"
     stopToastCountdown(sessionID)
     cancelDelivery(sessionID)
     await deliverPendingReminder(sessionID)
-    await injectResponse(sessionID, "premind: sending PR updates now", inputRef)
+    return "premind: delivering PR updates now"
+  }
+
+  const handleSendNowCommand = async (sessionID: string, inputRef?: { agent?: string; model?: { providerID: string; modelID: string } }) => {
+    await injectResponse(sessionID, await deliverPendingNow(sessionID), inputRef)
   }
 
   const handleDisableCommand = async (sessionID: string, inputRef?: { agent?: string; model?: { providerID: string; modelID: string } }) => {
@@ -789,6 +791,45 @@ export const createPremindPlugin = (dependencies: PremindPluginDependencies = {}
     )
   }
 
+  const getDoctorText = () => {
+    const state = readPluginRuntimeState()
+    const instances = readPluginInstances()
+    const otherInstances = instances.filter((instance) => instance.pid !== process.pid)
+    return [
+      `premind doctor ${PREMIND_VERSION_LABEL}`,
+      "- host: opencode",
+      `- pid: ${process.pid}`,
+      `- state file: ${getPluginRuntimeStatePath()}`,
+      `- phase: ${state.phase ?? "unknown"}`,
+      `- daemon started: ${state.daemonStarted === true ? "yes" : state.daemonStarted === false ? "no" : "unknown"}`,
+      `- client registered: ${state.clientRegistered === true ? "yes" : state.clientRegistered === false ? "no" : "unknown"}`,
+      `- commands registered: ${state.commandsRegistered === true ? "yes" : state.commandsRegistered === false ? "no" : "unknown"}`,
+      `- idle delivery threshold: ${idleDeliveryThreshold}ms`,
+      `- root: ${state.root ?? "unknown"}`,
+      `- last session: ${state.lastSessionId ?? "none"}`,
+      `- updated at: ${state.updatedAt ?? "unknown"}`,
+      ...(state.error ? [`- error: ${state.error}`] : []),
+      ...(otherInstances.length > 0
+        ? [`- other live instances (${otherInstances.length}):`, ...otherInstances.map((instance) => `  pid=${instance.pid} root=${instance.root ?? "?"} started=${instance.startedAt}`)]
+        : ["- other live instances: none"]),
+    ].join("\n")
+  }
+
+  const handleDoctorCommand = async (sessionID: string, inputRef?: { agent?: string; model?: { providerID: string; modelID: string } }) => {
+    await injectResponse(sessionID, getDoctorText(), inputRef)
+  }
+
+  const deliverTool = tool({
+    description: "Deliver pending PR updates to the current session immediately, without waiting for the idle countdown",
+    args: {},
+    async execute(_args, ctx) {
+      const sessionId = ctx.sessionID ?? lastPrimarySessionId
+      if (!sessionId) return "premind deliver failed: no active session"
+      ownedSessions.add(sessionId)
+      return deliverPendingNow(sessionId)
+    },
+  })
+
   return {
     // Register slash commands via config mutation.
     config: async (configInput: any) => {
@@ -803,9 +844,17 @@ export const createPremindPlugin = (dependencies: PremindPluginDependencies = {}
         template: COMMAND_MARKERS.status,
         description: "Show premind daemon status, attached sessions, and pending reminders",
       }
+      configInput.command["premind:doctor"] = {
+        template: COMMAND_MARKERS.doctor,
+        description: "Diagnose premind plugin, configuration, and daemon health",
+      }
+      configInput.command["premind:deliver"] = {
+        template: COMMAND_MARKERS.sendNow,
+        description: "Deliver pending PR updates to this session immediately",
+      }
       configInput.command["premind-send-now"] = {
         template: COMMAND_MARKERS.sendNow,
-        description: "Send pending PR updates to this session immediately without waiting for the idle countdown",
+        description: "Deprecated alias for /premind:deliver",
       }
       configInput.command["premind-disable"] = {
         template: COMMAND_MARKERS.disable,
@@ -886,21 +935,8 @@ export const createPremindPlugin = (dependencies: PremindPluginDependencies = {}
           return `premind unsubscribed from ${args.repo ?? "active worktree"}#${args.prNumber}.`
         },
       }),
-      premind_send_now: tool({
-        description: "Send pending PR updates to the current session immediately, without waiting for the idle countdown",
-        args: {},
-        async execute(_args, ctx) {
-          const sessionId = ctx.sessionID ?? lastPrimarySessionId
-          if (!sessionId) return "premind send-now failed: no active session"
-          ownedSessions.add(sessionId)
-          const pending = await daemon.getPendingReminder(sessionId)
-          if (!pending.batch) return "premind: no pending PR updates to send"
-          stopToastCountdown(sessionId)
-          cancelDelivery(sessionId)
-          await deliverPendingReminder(sessionId)
-          return "premind: sending PR updates now"
-        },
-      }),
+      premind_deliver: deliverTool,
+      premind_send_now: deliverTool,
       premind_disable: tool({
         description: "Disable premind globally. Stops GitHub polling across all sessions and projects; the daemon stays up so sessions keep registering. Useful for avoiding GitHub API rate limits.",
         args: {},
@@ -921,25 +957,7 @@ export const createPremindPlugin = (dependencies: PremindPluginDependencies = {}
         description: "Verify premind plugin initialization and return runtime diagnostics for this instance and all other live instances",
         args: {},
         async execute() {
-          const state = readPluginRuntimeState()
-          const instances = readPluginInstances()
-          const otherInstances = instances.filter((i) => i.pid !== process.pid)
-          return [
-            "premind probe",
-            `- pid: ${process.pid}`,
-            `- state file: ${getPluginRuntimeStatePath()}`,
-            `- phase: ${state.phase ?? "unknown"}`,
-            `- daemon started: ${state.daemonStarted === true ? "yes" : state.daemonStarted === false ? "no" : "unknown"}`,
-            `- client registered: ${state.clientRegistered === true ? "yes" : state.clientRegistered === false ? "no" : "unknown"}`,
-            `- commands registered: ${state.commandsRegistered === true ? "yes" : state.commandsRegistered === false ? "no" : "unknown"}`,
-            `- root: ${state.root ?? "unknown"}`,
-            `- last session: ${state.lastSessionId ?? "none"}`,
-            `- updated at: ${state.updatedAt ?? "unknown"}`,
-            ...(state.error ? [`- error: ${state.error}`] : []),
-            ...(otherInstances.length > 0
-              ? [`- other live instances (${otherInstances.length}):`, ...otherInstances.map((i) => `  pid=${i.pid} root=${i.root ?? "?"} started=${i.startedAt}`)]
-              : ["- other live instances: none"]),
-          ].join("\n")
+          return getDoctorText()
         },
       }),
     },
@@ -1042,6 +1060,9 @@ export const createPremindPlugin = (dependencies: PremindPluginDependencies = {}
       // Handle slash command markers injected via config.
       if (outputText.includes(COMMAND_MARKERS.status)) {
         await handleStatusCommand(input.sessionID, inputRef)
+      }
+      if (outputText.includes(COMMAND_MARKERS.doctor)) {
+        await handleDoctorCommand(input.sessionID, inputRef)
       }
       if (outputText.includes(COMMAND_MARKERS.sendNow)) {
         await handleSendNowCommand(input.sessionID, inputRef)

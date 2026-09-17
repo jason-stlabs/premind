@@ -19,6 +19,51 @@ test("status redacts session records", async () => {
   assert.match(value, /activeSessions/);
   assert.doesNotMatch(value, /secret|private\/repo/);
 });
+test("probe reports runtime, plugin, config, daemon, and delivery health", async () => {
+  const result = await handleMcpRequest(
+    { method: "tools/call", params: { name: "probe" } },
+    async (type) =>
+      type === "getGlobalDisabled"
+        ? { disabled: false }
+        : { daemon: { protocolVersion: 1 }, sessions: [{ sessionId: "secret" }] },
+    {
+      HOME: "/definitely-missing-premind-home",
+      CLAUDE_PLUGIN_ROOT: "/tmp/premind-plugin",
+    },
+  );
+  const value = JSON.parse(result.content[0].text);
+  assert.deepEqual(value.plugin, { version: "0.2.0", root: "/tmp/premind-plugin" });
+  assert.equal(value.runtime.requiredNode, ">=22.13.0");
+  assert.equal(value.runtime.compatible, true);
+  assert.deepEqual(value.daemon, {
+    reachable: true,
+    protocolVersion: 1,
+    globallyDisabled: false,
+  });
+  assert.equal(value.configSource, "schema defaults");
+  assert.match(value.delivery, /Stop-boundary only/);
+  assert.doesNotMatch(result.content[0].text, /secret/);
+});
+
+test("probe reports a redacted diagnostic when the daemon is unavailable", async () => {
+  const result = await handleMcpRequest(
+    { method: "tools/call", params: { name: "probe" } },
+    async () => {
+      throw new Error("private/session/path");
+    },
+    { HOME: "/definitely-missing-premind-home" },
+  );
+  const value = JSON.parse(result.content[0].text);
+  assert.deepEqual(value.daemon, {
+    reachable: false,
+    protocolVersion: null,
+    globallyDisabled: null,
+    error: "Premind daemon is unavailable.",
+  });
+  assert.equal(value.runtime.requiredNode, ">=22.13.0");
+  assert.equal(value.configSource, "schema defaults");
+  assert.doesNotMatch(result.content[0].text, /private\/session\/path/);
+});
 
 test("global controls are model-callable and describe their daemon-wide effect", async () => {
   const calls = [];

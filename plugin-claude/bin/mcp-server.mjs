@@ -1,8 +1,30 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { request } from "./lib.mjs";
 import { ensureDaemonRunning } from "./ensure-daemon.mjs";
+
+const PLUGIN_VERSION = "0.2.0";
+const REQUIRED_NODE = { major: 22, minor: 13 };
+const defaultPluginRoot = fileURLToPath(new URL("../", import.meta.url));
+
+const isNodeCompatible = (version = process.versions.node) => {
+  const [major = 0, minor = 0] = version.split(".").map(Number);
+  return major > REQUIRED_NODE.major ||
+    (major === REQUIRED_NODE.major && minor >= REQUIRED_NODE.minor);
+};
+
+const resolveConfigSource = (environment = process.env) => {
+  const home = environment.HOME ?? homedir();
+  const primary = join(home, ".config", "premind", "premind.jsonc");
+  const legacy = join(home, ".config", "opencode", "premind.jsonc");
+  if (existsSync(primary)) return primary;
+  if (existsSync(legacy)) return `${legacy} (legacy fallback)`;
+  return "schema defaults";
+};
 
 const tools = [
   {
@@ -17,7 +39,7 @@ const tools = [
   {
     name: "probe",
     description:
-      "Check whether the Premind daemon is reachable without exposing session data.",
+      "Report Claude plugin, Node runtime, configuration, daemon, and delivery health without exposing session data.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -123,11 +145,34 @@ export const handleMcpRequest = async (
     );
   }
   if (name === "probe") {
-    const disabled = await ipc("getGlobalDisabled", {});
+    const [disabledResult, statusResult] = await Promise.allSettled([
+      ipc("getGlobalDisabled", {}),
+      ipc("debugStatus", {}),
+    ]);
+    const reachable =
+      disabledResult.status === "fulfilled" && statusResult.status === "fulfilled";
+    const disabled =
+      disabledResult.status === "fulfilled" ? disabledResult.value : undefined;
+    const status =
+      statusResult.status === "fulfilled" ? statusResult.value : undefined;
     return text(
       JSON.stringify({
-        reachable: true,
-        globallyDisabled: Boolean(disabled.disabled),
+        plugin: {
+          version: PLUGIN_VERSION,
+          root: environment.CLAUDE_PLUGIN_ROOT ?? defaultPluginRoot,
+        },
+        runtime: {
+          node: process.versions.node,
+          requiredNode: ">=22.13.0",
+          compatible: isNodeCompatible(),
+        },
+        daemon: {
+          reachable,
+          protocolVersion: status?.daemon?.protocolVersion ?? null,
+          globallyDisabled: disabled ? Boolean(disabled.disabled) : null,
+          ...(reachable ? {} : { error: "Premind daemon is unavailable." }),
+        },
+        configSource: resolveConfigSource(environment),
         delivery:
           "Stop-boundary only; inactive Claude sessions are not woken in v0.2",
       }),
