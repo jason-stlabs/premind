@@ -57,7 +57,7 @@ The plugin requires **Node 22.13+** for `node:sqlite`. Its hooks start or reuse 
 
 Claude reminders are delivered only at a `Stop` boundary. A delivered batch is confirmed on Claude's next continuation Stop hook; interrupted handoffs become retryable, so duplicates are preferred to lost reminders. Inactive Claude sessions are not woken in v0.2.
 
-The plugin exposes namespaced MCP tools for `status`, `probe`, global `enable`/`disable`, and session-scoped `activate_worktree`, `subscribe`, and `unsubscribe`. Session-scoped tools derive the session solely from `CLAUDE_CODE_SESSION_ID`; missing or mismatched hook/MCP identity fails closed and asks you to reload the plugin. Claude commands are `/premind:status`, `/premind:doctor`, `/premind:enable`, `/premind:disable`, `/premind:subscribe`, and `/premind:unsubscribe`.
+The plugin exposes namespaced MCP tools for `status`, `probe`, global `enable`/`disable`, and session-scoped `set_active_checkout`, `subscribe`, and `unsubscribe`. Set the active checkout at the start of any PR work—including when already in the startup checkout—and again after switching branches before creating or following a PR. Session-scoped tools derive the session solely from `CLAUDE_CODE_SESSION_ID`; missing or mismatched hook/MCP identity fails closed and asks you to reload the plugin. Claude commands are `/premind:status`, `/premind:doctor`, `/premind:enable`, `/premind:disable`, `/premind:subscribe`, and `/premind:unsubscribe`.
 
 For an opt-in authenticated Claude CLI compatibility check (not part of CI), run:
 
@@ -125,7 +125,7 @@ premind registers these slash commands automatically:
 - `/premind-disable` — disable GitHub polling globally
 - `/premind-enable` — re-enable GitHub polling globally
 
-Worktree and subscription lifecycle replaces per-session pause/resume. OpenCode exposes `premind_activate_worktree`, `premind_subscribe`, and `premind_unsubscribe` model tools. The Pi package exposes the same tools plus `/premind:activate-worktree`, `/premind:subscribe`, and `/premind:unsubscribe` commands. Automatic watches are limited to PRs authored by Premind's authenticated GitHub account. Manual subscriptions may intentionally target an external `owner/repo`; their reminders include a guard that changes require explicit user instruction, and status/reminders use fully qualified `owner/repo#number` identities.
+Checkout and subscription lifecycle replaces per-session pause/resume. OpenCode exposes `premind_set_active_checkout`, `premind_subscribe`, and `premind_unsubscribe` model tools. The Pi package exposes the same tools plus `/premind:set-active-checkout`, `/premind:subscribe`, and `/premind:unsubscribe` commands. Set the active checkout at the start of any PR work—including when already in the startup checkout—and again after switching branches before creating or following a PR. Automatic watches are limited to PRs authored by Premind's authenticated GitHub account. Manual subscriptions may intentionally target an external `owner/repo`; their reminders include a guard that changes require explicit user instruction, and status/reminders use fully qualified `owner/repo#number` identities.
 
 `/premind-disable` is a daemon-wide kill switch: the daemon stays up and sessions keep registering, but no GitHub API calls are made until you re-enable. The flag is persisted in SQLite, so it survives daemon restarts. Queued events are preserved and delivered as normal once you re-enable.
 
